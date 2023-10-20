@@ -1,0 +1,548 @@
+import pandas as pd
+import numpy as np
+import datacompy
+#import pyodbc
+#from pymongo import MongoClient
+#import dateutil
+#from dateutil import parser
+from pandas import DataFrame
+import pandas as pd
+import sys
+import snowflake.connector as sf_c
+from snowflake.connector.pandas_tools import write_pandas
+from sqlalchemy import create_engine
+#import cx_Oracle
+import os
+#import sweetviz as sv
+import configparser
+import pyodbc
+import re
+import datetime as dt
+import logging
+import re
+import sqlalchemy
+
+TABLE_REFRESH_WHITE_LIST_ID = sys.argv[1]
+
+
+
+config = configparser.ConfigParser()
+
+config.read_file(open(r'setup_prd_migration.ini'))
+oracleHostName = config.get('oracle-configuration', 'oracleHostName')
+sqlserverHostName_HCHB = config.get('sqlserver-configuration', 'sqlServerHostName_HCHB')
+snowflakeAccount = config.get('snowflake-configuration', 'snowflakeAccount')
+
+credentialsconfig = configparser.ConfigParser()
+credentialsconfig.read_file(open(r'configurations_setup_prd_migration.ini'))
+oracleUserName = credentialsconfig.get('oracle-credentials', 'oracleUserName')
+oraclePassword = credentialsconfig.get('oracle-credentials', 'oraclePassword')
+dbName = credentialsconfig.get('oracle-credentials', 'dbName')
+
+sqlserverUserName_HCHB = 'hchbetl'
+sqlserverPassword_HCHB = credentialsconfig.get('sqlserver-credentials', 'sqlserverPassword_HCHB')
+sqlserverDbName_HCHB = credentialsconfig.get('sqlserver-credentials', 'sqlserverDbName_HCHB')
+sqlserverSchemaName_HCHB = credentialsconfig.get('sqlserver-credentials', 'sqlserverSchemaName_HCHB')
+
+
+snowflakeUserName_sit = credentialsconfig.get('snowflake-credentials', 'snowflakeUserName_sit')
+snowflakePassword_sit = credentialsconfig.get('snowflake-credentials', 'snowflakePassword_sit')
+snowflakeWarehouse_sit = credentialsconfig.get('snowflake-credentials', 'snowflakeWarehouse_sit')
+snowflakeRole_sit_sit = credentialsconfig.get('snowflake-credentials', 'snowflakeRole_sit')
+snowflakeDBName_sit = credentialsconfig.get('snowflake-credentials', 'snowflakeDatabase_sit')
+snowflakeSchema_sit='DLAKESIT'
+
+snowflakeUserName_prd = credentialsconfig.get('snowflake-credentials', 'snowflakeUserName_prd')
+snowflakePassword_prd = credentialsconfig.get('snowflake-credentials', 'snowflakePassword_prd')
+snowflakeWarehouse_prd = credentialsconfig.get('snowflake-credentials', 'snowflakeWarehouse_prd')
+snowflakeRole_prd_prd = credentialsconfig.get('snowflake-credentials', 'snowflakeRole_prd')
+snowflakeDBName_prd = credentialsconfig.get('snowflake-credentials', 'snowflakeDatabase_prd')
+snowflakeSchema_prd='HCHB'
+
+
+
+    
+def snowFlakeConnection():
+    try:
+        conn = sf_c.connect(
+            user=snowflakeUserName_prd,
+            password=snowflakePassword_prd,
+            account=snowflakeAccount,
+            warehouse=snowflakeWarehouse_prd,
+            database=snowflakeDBName_prd,
+            schema=snowflakeSchema_prd,
+ #           client_session_keep_alive=True
+        )
+        print("connected to SNOWFLAKE Database.")
+        return conn
+    except Exception as e:
+        print("Error connecting to SNOWFLAKE Database. " + str(e))
+        
+sf_conn = snowFlakeConnection()
+
+#detching table assosciated with the data transfer
+df_QE = pd.read_sql_query("select * from NEXUS.JMAN.TABLE_REFRESH_WHITE_LIST", sf_conn)
+
+def creds(DB_NAME):
+    if (DB_NAME == 'DLAKESIT' or DB_NAME =='NEXUSSIT'):
+        a= [snowflakeUserName_sit,snowflakePassword_sit,snowflakeAccount,snowflakeWarehouse_sit,snowflakeDBName_sit,snowflakeSchema_sit]
+    if (DB_NAME == 'DLAKE' or DB_NAME =='NEXUS'):
+        a =  [snowflakeUserName_prd,snowflakePassword_prd,snowflakeAccount,snowflakeWarehouse_prd,snowflakeDBName_prd,snowflakeSchema_prd]
+    if(DB_NAME == 'HCHB' or DB_NAME =='HCHB_DAS' or DB_NAME == 'VNSNY_BI' ):
+        a =  [sqlserverHostName_HCHB,sqlserverDbName_HCHB,sqlserverUserName_HCHB,sqlserverPassword_HCHB]
+    return a
+        
+for i, row in enumerate(df_QE.itertuples()):
+    if(str(row.TABLE_REFRESH_WHITE_LIST_ID)== TABLE_REFRESH_WHITE_LIST_ID):
+        
+        #the below function is to determine if source is snpowflake or sql server 
+        def db_name(DB_NAME):
+            sf_db_list = ['DLAKE','NEXUS','DLAKESIT','NEXUSSIT']
+            sql_db_list = ['HCHB','D365','HCHB_DAS','VNSNY_BI']
+            if DB_NAME in sf_db_list:
+                return  'SNOWFLAKE'
+            elif DB_NAME in sql_db_list:
+                return 'SQL SERVER'
+            
+        SOURCE_DB_NAME = db_name(row.SOURCE_DB)
+        TARGET_DB_NAME = db_name(row.TARGET_DB)
+        
+        if (row.LOAD_TYPE =='FULL_REFRESH' and SOURCE_DB_NAME == 'SNOWFLAKE' and TARGET_DB_NAME == 'SQL SERVER'):
+            
+            #source connection
+            def snowFlakeConnection_2():
+                try:
+                    conn = sf_c.connect(
+                    user=creds(row.SOURCE_DB)[0],
+                    password=creds(row.SOURCE_DB)[1],
+                    account=creds(row.SOURCE_DB)[2],
+                    warehouse=creds(row.SOURCE_DB)[3],
+                    database=row.SOURCE_DB,
+                    schema=row.SOURCE_SCHEMA,
+         #           client_session_keep_alive=True
+                )
+                    print("connected to SNOWFLAKE Database.")
+                    return conn
+                except Exception as e:
+                    print("Error connecting to SNOWFLAKE Database. " + str(e))
+                    
+                    
+            sf_conn_2 = snowFlakeConnection_2()
+            sf_cur = sf_conn_2.cursor()
+            
+            try:
+
+            #ESTABLISHING CONNECTION WITH SQL SERVER                 
+                cnxn = pyodbc.connect('DRIVER={ODBC Driver 17 for SQL Server};SERVER='+creds(row.TARGET_DB)[0]+';DATABASE='+creds(row.TARGET_DB)[1]+';UID='+creds(row.TARGET_DB)[2]+';PWD='+ creds(row.TARGET_DB)[3]) 
+                
+                
+            
+                print('connection established')
+                cursor = cnxn.cursor()
+                
+                #PRE SQL EXECUTION
+
+                
+                if(str(row.PRE_SQL) == 'None' ):
+                    print('PRE_SQL does not exist')
+                else:
+                    presql_lst =re.findall(r'"([^"]*)"', row.PRE_SQL)
+                    for i in presql_lst:
+                        
+                        sf_cur.execute(i)
+                        sf_conn_2.commit()
+                        print ('PRE_SQL executed SUCCESSFULLY')
+                
+                #TRUNCATE STEP
+                
+                cursor.execute('TRUNCATE TABLE '+row.TARGET_DB +'.'+row.TARGET_SCHEMA+'.'+row.TARGET_TABLE_NAME)
+                cnxn.commit()
+                print(row.TARGET_DB +'.'+row.TARGET_SCHEMA+'.'+row.TARGET_TABLE_NAME + ' has been truncated')
+                
+                #APPEND STEP
+                
+                
+                #con = create_engine('mssql+pyodbc://'+creds(row.TARGET_DB)[2]+':'+creds(row.TARGET_DB)[3]+'@'+creds(row.TARGET_DB)[0]+':1433/'+row.TARGET_DB+'?driver=ODBC Driver 17 for SQL Server')
+                
+                
+                
+
+                
+                sf_cur.execute("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME)
+                #fetching count
+                count = sf_cur.rowcount
+                print(str(count) + ' records are being appended')
+                    
+                new_list = []
+                i=0
+                while (i<count):
+                    new_list.append(i)
+                    i = i+500000
+                    
+                batch_count = 1
+                for count1 in new_list:
+                #FETCHING HEADERS
+                    source_headers = pd.read_sql_query("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+" limit 1", sf_conn_2)
+                    
+                    #FETCHING DATA 500K AT A TIME
+                    SOURCE_DF = pd.read_sql_query("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+" order by " + source_headers.columns[0]+ " limit 500000 offset "+ str(count1) , sf_conn_2)
+                    #SOURCE_DF= SOURCE_DF.set_index(SOURCE_DF.columns[0])
+                    
+                    #ESTABLISHING CONECTION TO SQL SERVER
+                    constring = 'mssql+pyodbc://'+creds(row.TARGET_DB)[2]+':'+creds(row.TARGET_DB)[3]+'@'+creds(row.TARGET_DB)[0]+':1433/'+row.TARGET_DB+'?driver=ODBC Driver 17 for SQL Server'
+
+                   # GENERATING FAST EXECUTE MANY ENGINE
+                    dbEngine = sqlalchemy.create_engine(constring, fast_executemany=True, connect_args={'connect_timeout': 10}, echo=False) 
+                    
+                    #DATA TRASNFER TO SQL SERVER 
+                    SOURCE_DF.to_sql(con=dbEngine, schema=row.TARGET_SCHEMA, name=row.TARGET_TABLE_NAME, if_exists="append", index=False, chunksize=5000)
+                    #SOURCE_DF.to_sql(row.TARGET_TABLE_NAME, con, schema=row.TARGET_SCHEMA, if_exists='append')
+                    print('Batch '+ str(batch_count)+ ' loaded' )
+                    batch_count = batch_count +1
+                    
+                print(row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+' HAS BEEN APPENDED TO '+row.TARGET_DB +'.'+row.TARGET_SCHEMA+'.'+row.TARGET_TABLE_NAME)     
+                    
+                    
+                #POST SQL
+                
+                if(str(row.POST_SQL) == 'None' ):
+                    print('POST_SQL does not exist')
+                else:
+                    postsql_lst =re.findall(r'"([^"]*)"', row.POST_SQL)
+                    for i in postsql_lst:
+                        
+                        sf_cur.execute(i)
+                        sf_conn_2.commit()
+                        print ('POST_SQL executed SUCCESSFULLY')  
+                        
+                print('PROCESS COMPLETED')  
+                
+                sf_conn_2.close()
+                sf_cur.close()
+                cursor.close()
+                cnxn.close()
+                
+            except pyodbc.Error as err:
+                logging.warn(err)    
+            
+        elif (row.LOAD_TYPE =='FULL_REFRESH' and SOURCE_DB_NAME == 'SNOWFLAKE' and TARGET_DB_NAME == 'SNOWFLAKE'):
+            
+            #source connection
+            def snowFlakeConnection_2():
+                
+                try:
+                    conn = sf_c.connect(
+                    user=creds(row.SOURCE_DB)[0],
+                    password=creds(row.SOURCE_DB)[1],
+                    account=creds(row.SOURCE_DB)[2],
+                    warehouse=creds(row.SOURCE_DB)[3],
+                    database=row.SOURCE_DB,
+                    schema=row.SOURCE_SCHEMA,
+         #           client_session_keep_alive=True
+                )
+                    print("connected to SNOWFLAKE Database.")
+                    return conn
+                except Exception as e:
+                    print("Error connecting to SNOWFLAKE Database. " + str(e))
+                    
+                    
+            sf_conn_2 = snowFlakeConnection_2()
+            sf_cur = sf_conn_2.cursor()
+            
+            #PRE SQL
+            if(str(row.PRE_SQL) == 'None' ):
+                print('PRE_SQL does not exist')
+            else:
+                presql_lst =re.findall(r'"([^"]*)"', row.PRE_SQL)
+                for i in presql_lst:
+                    
+                    sf_cur.execute(i)
+                    sf_conn_2.commit()
+                    print ('PRE_SQL executed SUCCESSFULLY')
+                
+            #TRUNCATE STEP
+            
+            sf_cur.execute('TRUNCATE TABLE '+row.TARGET_DB +'.'+row.TARGET_SCHEMA+'.'+row.TARGET_TABLE_NAME)
+            sf_conn_2.commit()
+            print(row.TARGET_DB +'.'+row.TARGET_SCHEMA+'.'+row.TARGET_TABLE_NAME + ' has been truncated')
+            
+            #DATA LOAD STEP
+            
+             #EXECUTING APPEND
+            sf_cur.execute("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME)
+            #fetching count
+            count = sf_cur.rowcount
+            print(str(count) + ' records are being appended')
+                    
+            new_list = []
+            i=0
+            while (i<count):
+                new_list.append(i)
+                i = i+500000
+                
+            batch_count = 1
+            for count1 in new_list:
+            
+            
+                source_headers = pd.read_sql_query("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+" limit 1", sf_conn_2)
+                SOURCE_DF = pd.read_sql_query("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+" order by " + source_headers.columns[0]+ " limit 500000 offset "+ str(count1) , sf_conn_2)
+                #SOURCE_DF= SOURCE_DF.set_index(SOURCE_DF.columns[0])
+                
+                
+                #PUSHING DATA INTO SNOWFLAKE 
+                
+                write_pandas(
+                      conn=sf_conn_2,
+                      df=SOURCE_DF,
+                      table_name= row.TARGET_TABLE_NAME,
+                      database= row.TARGET_DB,
+                      schema= row.TARGET_SCHEMA
+                             )
+                print('Batch '+ str(batch_count)+ ' loaded' )
+                batch_count = batch_count +1
+                
+                
+                
+            print(row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+' HAS BEEN APPENDED TO '+row.TARGET_DB +'.'+row.TARGET_SCHEMA+'.'+row.TARGET_TABLE_NAME)
+            #POST SQL
+                
+                            
+            if(str(row.POST_SQL) == 'None' ):
+                print('POST_SQL does not exist')
+            else:
+                postsql_lst =re.findall(r'"([^"]*)"', row.POST_SQL)
+                for i in postsql_lst:
+                    
+                    sf_cur.execute(i)
+                    sf_conn_2.commit()
+                    print ('POST_SQL executed SUCCESSFULLY')  
+            print('PROCESS COMPLETED')
+            
+            sf_conn_2.close()
+            sf_cur.close()
+
+
+        elif (row.LOAD_TYPE =='APPEND' and SOURCE_DB_NAME == 'SNOWFLAKE' and TARGET_DB_NAME == 'SQL SERVER'):
+            
+            
+            
+            
+            #source connection
+            def snowFlakeConnection_2():
+                try:
+                    conn = sf_c.connect(
+                    user=creds(row.SOURCE_DB)[0],
+                    password=creds(row.SOURCE_DB)[1],
+                    account=creds(row.SOURCE_DB)[2],
+                    warehouse=creds(row.SOURCE_DB)[3],
+                    database=row.SOURCE_DB,
+                    schema=row.SOURCE_SCHEMA,
+         #           client_session_keep_alive=True
+                )
+                    print("connected to SNOWFLAKE Database.")
+                    return conn
+                except Exception as e:
+                    print("Error connecting to SNOWFLAKE Database. " + str(e))
+                    
+                    
+            sf_conn_2 = snowFlakeConnection_2()
+            sf_cur = sf_conn_2.cursor()
+            
+            try:
+                cnxn = pyodbc.connect('DRIVER={ODBC Driver 17 for SQL Server};SERVER='+creds(row.TARGET_DB)[0]+';DATABASE='+creds(row.TARGET_DB)[1]+';UID='+creds(row.TARGET_DB)[2]+';PWD='+ creds(row.TARGET_DB)[3]) 
+            
+                print('connection established')
+                cursor = cnxn.cursor()
+                
+                #PRE SQL
+                if(str(row.PRE_SQL) == 'None' ):
+                    print('PRE_SQL does not exist')
+                else:
+                    presql_lst =re.findall(r'"([^"]*)"', row.PRE_SQL)
+                    for i in presql_lst:
+                        
+                        sf_cur.execute(i)
+                        sf_conn_2.commit()
+                        print ('PRE_SQL executed SUCCESSFULLY')        
+               
+                #APPEND STEP
+                
+                
+                #con = create_engine('mssql+pyodbc://'+creds(row.TARGET_DB)[2]+':'+creds(row.TARGET_DB)[3]+'@'+creds(row.TARGET_DB)[0]+':1433/'+row.TARGET_DB+'?driver=ODBC Driver 17 for SQL Server')
+                
+                sf_cur.execute("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME)
+                #fetching count
+                count = sf_cur.rowcount
+                print(str(count) + ' records are being appended')
+                    
+                new_list = []
+                i=0
+                while (i<count):
+                    new_list.append(i)
+                    i = i+500000
+                    
+                batch_count = 1
+                for count1 in new_list:
+                    source_headers = pd.read_sql_query("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+" limit 1", sf_conn_2)
+                    SOURCE_DF = pd.read_sql_query("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+" order by " + source_headers.columns[0]+ " limit 500000 offset "+ str(count1) , sf_conn_2)
+                    #SOURCE_DF= SOURCE_DF.set_index(SOURCE_DF.columns[0])
+                    
+                    constring = 'mssql+pyodbc://'+creds(row.TARGET_DB)[2]+':'+creds(row.TARGET_DB)[3]+'@'+creds(row.TARGET_DB)[0]+':1433/'+row.TARGET_DB+'?driver=ODBC Driver 17 for SQL Server'
+
+                    dbEngine = sqlalchemy.create_engine(constring, fast_executemany=True, connect_args={'connect_timeout': 10}, echo=False) 
+                    SOURCE_DF.to_sql(con=dbEngine, schema=row.TARGET_SCHEMA, name=row.TARGET_TABLE_NAME, if_exists="append", index=False, chunksize=5000)
+                    
+                    
+                    #SOURCE_DF.to_sql(row.TARGET_TABLE_NAME, con, schema=row.TARGET_SCHEMA, if_exists='append')
+                    print('Batch '+ str(batch_count)+ ' loaded' )
+                    batch_count = batch_count +1
+                    
+                print(row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+' HAS BEEN APPENDED TO '+row.TARGET_DB +'.'+row.TARGET_SCHEMA+'.'+row.TARGET_TABLE_NAME)    
+                #POST SQL
+                
+                                
+                if(str(row.POST_SQL) == 'None' ):
+                    print('POST_SQL does not exist')
+                else:
+                    postsql_lst =re.findall(r'"([^"]*)"', row.POST_SQL)
+                    for i in postsql_lst:
+                        
+                        sf_cur.execute(i)
+                        sf_conn_2.commit()
+                        print ('POST_SQL executed SUCCESSFULLY')  
+
+                    
+                print('PROCESS COMPLETED') 
+                
+                sf_conn_2.close()
+                sf_cur.close()
+                cursor.close()
+                cnxn.close()
+                
+            except pyodbc.Error as err:
+                logging.warn(err)    
+            
+        elif (row.LOAD_TYPE =='APPEND' and SOURCE_DB_NAME == 'SNOWFLAKE' and TARGET_DB_NAME == 'SNOWFLAKE'):
+            
+            #source connection
+            def snowFlakeConnection_2():
+                try:
+                    conn = sf_c.connect(
+                    user=creds(row.SOURCE_DB)[0],
+                    password=creds(row.SOURCE_DB)[1],
+                    account=creds(row.SOURCE_DB)[2],
+                    warehouse=creds(row.SOURCE_DB)[3],
+                    database=row.SOURCE_DB,
+                    schema=row.SOURCE_SCHEMA,
+         #           client_session_keep_alive=True
+                )
+                    print("connected to SNOWFLAKE Database.")
+                    return conn
+                except Exception as e:
+                    print("Error connecting to SNOWFLAKE Database. " + str(e))
+                    
+                    
+            sf_conn_2 = snowFlakeConnection_2()
+            sf_cur = sf_conn_2.cursor()
+
+            #PRE SQL
+            
+            if(str(row.PRE_SQL) == 'None' ):
+                print('PRE_SQL does not exist')
+            else:
+                presql_lst =re.findall(r'"([^"]*)"', row.PRE_SQL)
+                for i in presql_lst:
+                    
+                    sf_cur.execute(i)
+                    sf_conn_2.commit()
+                    print ('PRE_SQL executed SUCCESSFULLY')
+            
+            #DATA LOAD STEP
+            
+             #EXECUTING APPEND
+            sf_cur.execute("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME)
+            #fetching count
+            count = sf_cur.rowcount
+            print(str(count) + ' records are being appended')
+                    
+            new_list = []
+            i=0
+            while (i<count):
+                new_list.append(i)
+                i = i+500000
+                
+            batch_count = 1
+            for count1 in new_list:
+                source_headers = pd.read_sql_query("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+" limit 1", sf_conn_2)
+                SOURCE_DF = pd.read_sql_query("select * from " +row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+" order by " + source_headers.columns[0]+ " limit 500000 offset "+ str(count1) , sf_conn_2)
+                #SOURCE_DF= SOURCE_DF.set_index(SOURCE_DF.columns[0])
+                write_pandas(
+                      conn=sf_conn_2,
+                      df=SOURCE_DF,
+                      table_name= row.TARGET_TABLE_NAME,
+                      database= row.TARGET_DB,
+                      schema= row.TARGET_SCHEMA
+                             )
+                print('Batch '+ str(batch_count)+ ' loaded' )
+                batch_count = batch_count +1
+                
+            print(row.SOURCE_DB +'.'+row.SOURCE_SCHEMA+'.'+row.SOURCE_TABLE_NAME+' HAS BEEN APPENDED TO '+row.TARGET_DB +'.'+row.TARGET_SCHEMA+'.'+row.TARGET_TABLE_NAME)    
+            #POST SQL
+                
+                            
+            if(str(row.POST_SQL) == 'None' ):
+                print('POST_SQL does not exist')
+            else:
+                postsql_lst =re.findall(r'"([^"]*)"', row.POST_SQL)
+                for i in postsql_lst:
+                    
+                    sf_cur.execute(i)
+                    sf_conn_2.commit()
+                    print ('POST_SQL executed SUCCESSFULLY')  
+                    
+            print('PROCESS COMPLETED')
+            
+            sf_conn_2.close()
+            sf_cur.close()
+
+
+        else :
+            print('INVALID ENTRIES INTO THE CONTROL TABLE')
+            
+sf_conn.close()                
+
+            
+            
+                
+                
+                
+                
+                
+
+                    
+                    
+           
+                
+                
+                
+                
+                
+                
+
+                
+                
+            
+            
+            
+            
+            
+            
+            
+                    
+             
+
+
+            
+      
+        
+        
